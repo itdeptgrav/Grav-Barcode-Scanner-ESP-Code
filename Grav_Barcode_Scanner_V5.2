@@ -1,0 +1,1057 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// GRAV Scanner Firmware v5.2.0
+//
+// CHANGES FROM v5.0.0:
+//  1. Batch send interval: 10 min → 5 min
+//  2. NTP fix: Indian NTP server added, wait up to 10s (was 2s)
+//  3. Timestamp sanitize in bulk send: 1969/1970 replaced with current time
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#include <HardwareSerial.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Update.h>
+
+// ─── WiFi Manager ─────────────────────────────────────────────────────────────
+WebServer server(80);
+DNSServer dnsServer;
+const byte DNS_PORT  = 53;
+const char* AP_SSID  = "Grav_Production";
+const char* AP_PASSWORD = "Grav_production_2702";
+String fullAP_SSID;
+String wifiSSID = "";
+String wifiPass = "";
+String deviceId    = "";
+String machineId   = "";
+String machineName = "";
+bool wifiConfigured       = false;
+bool machineIdConfigured  = false;
+bool inConfigMode         = false;
+unsigned long configModeStartTime = 0;
+const unsigned long CONFIG_MODE_TIMEOUT            = 300000;
+unsigned long lastWiFiConnectionAttempt            = 0;
+const unsigned long WIFI_CONNECTION_RETRY_INTERVAL = 30000;
+int wifiConnectionFailCount = 0;
+bool lastWiFiState = false;
+
+// ─── Info Mode ────────────────────────────────────────────────────────────────
+const char* INFO_KEYWORD = "INFO_ADMIN_2790";
+bool infoModeActive = false;
+unsigned long infoModeStartTime = 0;
+const unsigned long INFO_MODE_DURATION = 10000;
+
+// ─── OTA ──────────────────────────────────────────────────────────────────────
+String currentFirmwareVersion = "5.2.0";
+bool   updateAvailable    = false;
+String newFirmwareUrl     = "";
+String newFirmwareVersion = "";
+unsigned long lastUpdateCheck = 0;
+const unsigned long UPDATE_CHECK_INTERVAL = 3600000;
+const String API_BASE_URL        = "https://grav-cms-backend.onrender.com/api";
+const String DEVICE_REGISTER_URL = API_BASE_URL + "/barcode-devices/check-update";
+const String MACHINE_NAME_URL    = API_BASE_URL + "/machines/";
+
+// ─── API ──────────────────────────────────────────────────────────────────────
+String BULK_API_URL = "https://barcode-scan-lmcb.onrender.com/api/cms/production/barcode_punchings/bulk-scans";
+
+// ─── Firebase ─────────────────────────────────────────────────────────────────
+const String FIREBASE_DB_URL = "https://grav-cms-38f45-default-rtdb.firebaseio.com";
+const unsigned long FIREBASE_POLL_INTERVAL = 10000;
+unsigned long lastFirebasePoll = 0;
+String lastActiveOpsCache = "";
+unsigned long lastFirebaseChangeTime = 0;
+const unsigned long FIREBASE_CHANGE_DEBOUNCE = 500;
+
+// ─── Batch Send — 5 minutes ───────────────────────────────────────────────────
+const unsigned long BATCH_SEND_INTERVAL = 5UL * 60UL * 1000UL;  // CHANGED: 10min → 5min
+unsigned long lastBatchSend = 0;
+bool sendBatchNow = false;
+
+// ─── NVS Persist Timer ────────────────────────────────────────────────────────
+const unsigned long NVS_PERSIST_INTERVAL = 5UL * 60UL * 1000UL;
+unsigned long lastNVSPersist = 0;
+bool nvsDirty = false;
+
+// ─── Display / Message ────────────────────────────────────────────────────────
+unsigned long messageShowUntil = 0;
+bool messagePending = false;
+String pendingReturnScreen = "";
+unsigned long scanFeedbackUntil = 0;
+String scanFeedbackReturn = "";
+
+// ─── Scan Debounce ────────────────────────────────────────────────────────────
+unsigned long lastAcceptedScanTime = 0;
+const unsigned long SCAN_DEBOUNCE_MS = 4000;
+
+// ─── Spinner ──────────────────────────────────────────────────────────────────
+TaskHandle_t   spinnerTaskHandle = NULL;
+volatile bool  spinnerRunning    = false;
+const uint16_t SPINNER_BG        = 0x0A51;
+
+// ─── Visual Feedback ──────────────────────────────────────────────────────────
+unsigned long visualFeedbackUntil = 0;
+bool   visualFeedbackActive    = false;
+String visualFeedbackMessage   = "";
+bool   visualFeedbackIsSuccess = false;
+
+// ─── Break Mode ───────────────────────────────────────────────────────────────
+enum BreakReason { BREAK_NONE=0, BREAK_WASHROOM=1, BREAK_BREAKDOWN=2, BREAK_OTHER=3 };
+const char* BREAK_CODE_WASHROOM  = "BREAK_WASHROOM";
+const char* BREAK_CODE_BREAKDOWN = "BREAK_BREAKDOWN";
+const char* BREAK_CODE_OTHER     = "BREAK_OTHER";
+BreakReason currentBreakReason   = BREAK_NONE;
+time_t      breakStartEpoch      = 0;
+unsigned long breakStartMillis   = 0;
+bool breakStartedThisSession     = false;
+unsigned long lastBreakScreenRefresh = 0;
+const unsigned long BREAK_TIMER_REFRESH_MS = 1000;
+const char* BREAK_NAMESPACE = "scanner_brk";
+
+// ─── WO History ───────────────────────────────────────────────────────────────
+const int MAX_WO_HISTORY = 40;
+String woHistory[MAX_WO_HISTORY];
+int woHistoryCount = 0;
+const char* WO_NAMESPACE = "scanner_wo";
+
+// ─── Forward Declarations ─────────────────────────────────────────────────────
+extern bool   isEmployeeSignedIn;
+extern String currentEmployeeName;
+extern String currentEmployeeId;
+void showEmployeeScreen();
+void showNoOperatorScreen();
+void showFirebaseSyncScreen(int, int);
+void showOpsOnScreen(int);
+void drawHeader();
+bool isWiFiConnected();
+void showBreakScreen();
+void refreshBreakTimerArea();
+void returnToHomeScreen();
+void drawNameLine(int, uint16_t);
+void startSpinner();
+void stopSpinner();
+void logBreakEventToFirebase(BreakReason reason, const char* action,
+                             unsigned long durationSec=0, const char* endedBy=nullptr);
+String getISOTimeIST();
+
+// ─── Admin ────────────────────────────────────────────────────────────────────
+const char* ADMIN_KEYWORD = "ADMIN-CONFIG-94731";
+bool checkForAdminConfig(String s) { return s.indexOf(ADMIN_KEYWORD) >= 0; }
+
+// ─── WiFi Update Barcode ──────────────────────────────────────────────────────
+bool isWiFiUpdateBarcode(const String& s) {
+  String u = s; u.toUpperCase();
+  return u.startsWith("SSID:") && u.indexOf(",PASSWORD:") > 0;
+}
+bool parseWiFiUpdateBarcode(const String& s, String& outSSID, String& outPass) {
+  String u = s; u.toUpperCase();
+  int ssidStart = u.indexOf("SSID:");
+  int passStart = u.indexOf(",PASSWORD:");
+  if (ssidStart < 0 || passStart < 0) return false;
+  outSSID = s.substring(ssidStart + 5, passStart);
+  outPass = s.substring(passStart + 10);
+  outSSID.trim(); outPass.trim();
+  return outSSID.length() > 0;
+}
+void handleWiFiUpdateBarcode(const String& s);
+
+// ─── Operations ───────────────────────────────────────────────────────────────
+const int MAX_ACTIVE_OPS = 8;
+String activeOperations[MAX_ACTIVE_OPS];
+int activeOpCount = 0;
+
+bool isOpsKeyword(String s)      { return s.startsWith("ops:"); }
+bool isOpsGroupKeyword(String s) { return s.startsWith("opsgp:"); }
+String extractOpName(String s)   { return s.length()>4 ? s.substring(4) : ""; }
+
+int extractGroupOps(String s, String out[], int maxOps) {
+  String payload = s.substring(6); payload.trim();
+  int count=0, start=0;
+  for (int i=0;i<=(int)payload.length()&&count<maxOps;i++) {
+    if (i==(int)payload.length()||payload.charAt(i)==',') {
+      String t=payload.substring(start,i); t.trim();
+      if (t.length()>0) out[count++]=t;
+      start=i+1;
+    }
+  }
+  return count;
+}
+bool toggleOperation(String opName) {
+  opName.trim(); if (opName.length()==0) return false;
+  for (int i=0;i<activeOpCount;i++) {
+    if (activeOperations[i].equalsIgnoreCase(opName)) {
+      for (int j=i;j<activeOpCount-1;j++) activeOperations[j]=activeOperations[j+1];
+      activeOperations[activeOpCount-1]=""; activeOpCount--; return false;
+    }
+  }
+  if (activeOpCount<MAX_ACTIVE_OPS) activeOperations[activeOpCount++]=opName;
+  return true;
+}
+void toggleGroupOps(String ops[], int count, int& si, int& so) {
+  si=0; so=0; for (int i=0;i<count;i++) { if (toggleOperation(ops[i])) si++; else so++; }
+}
+String getActiveOpsString() {
+  String r=""; for (int i=0;i<activeOpCount;i++) { if (i>0) r+=","; r+=activeOperations[i]; } return r;
+}
+bool isOpActive(String code) {
+  code.trim(); for (int i=0;i<activeOpCount;i++) if (activeOperations[i].equalsIgnoreCase(code)) return true; return false;
+}
+void setActiveOpsFromFirebase(String desired[], int desiredCount, int& si, int& so) {
+  si=0; so=0;
+  for (int i=activeOpCount-1;i>=0;i--) {
+    bool found=false;
+    for (int j=0;j<desiredCount;j++) if (activeOperations[i].equalsIgnoreCase(desired[j])) { found=true; break; }
+    if (!found) { for (int k=i;k<activeOpCount-1;k++) activeOperations[k]=activeOperations[k+1]; activeOperations[activeOpCount-1]=""; activeOpCount--; so++; }
+  }
+  for (int j=0;j<desiredCount;j++) if (!isOpActive(desired[j])&&activeOpCount<MAX_ACTIVE_OPS) { activeOperations[activeOpCount++]=desired[j]; si++; }
+}
+
+// ─── WO History ───────────────────────────────────────────────────────────────
+bool isWOInHistory(const String& wo) {
+  for (int i=0;i<woHistoryCount;i++) if (woHistory[i].equalsIgnoreCase(wo)) return true; return false;
+}
+void saveWOHistory() {
+  Preferences p; p.begin(WO_NAMESPACE,false); p.clear();
+  p.putInt("count",woHistoryCount);
+  for (int i=0;i<woHistoryCount;i++) { String k="w"+String(i); p.putString(k.c_str(),woHistory[i]); }
+  p.end();
+}
+void loadWOHistory() {
+  Preferences p; p.begin(WO_NAMESPACE,true);
+  woHistoryCount=p.getInt("count",0); if (woHistoryCount>MAX_WO_HISTORY) woHistoryCount=MAX_WO_HISTORY;
+  for (int i=0;i<woHistoryCount;i++) { String k="w"+String(i); woHistory[i]=p.getString(k.c_str(),""); }
+  p.end();
+}
+void clearWOHistory() {
+  woHistoryCount=0; for (int i=0;i<MAX_WO_HISTORY;i++) woHistory[i]="";
+  Preferences p; p.begin(WO_NAMESPACE,false); p.clear(); p.end();
+}
+void addWOToHistory(const String& wo) {
+  if (isWOInHistory(wo)) return;
+  if (woHistoryCount<MAX_WO_HISTORY) woHistory[woHistoryCount++]=wo;
+  else { for (int i=0;i<MAX_WO_HISTORY-1;i++) woHistory[i]=woHistory[i+1]; woHistory[MAX_WO_HISTORY-1]=wo; }
+  nvsDirty=true;
+}
+
+// ─── Break ────────────────────────────────────────────────────────────────────
+bool isBreakBarcode(const String& s) {
+  return s.equalsIgnoreCase(BREAK_CODE_WASHROOM)||s.equalsIgnoreCase(BREAK_CODE_BREAKDOWN)||s.equalsIgnoreCase(BREAK_CODE_OTHER);
+}
+BreakReason parseBreakReason(const String& s) {
+  if (s.equalsIgnoreCase(BREAK_CODE_WASHROOM))  return BREAK_WASHROOM;
+  if (s.equalsIgnoreCase(BREAK_CODE_BREAKDOWN)) return BREAK_BREAKDOWN;
+  if (s.equalsIgnoreCase(BREAK_CODE_OTHER))     return BREAK_OTHER;
+  return BREAK_NONE;
+}
+String breakReasonLabel(BreakReason r) {
+  switch(r) { case BREAK_WASHROOM: return "WASHROOM GO"; case BREAK_BREAKDOWN: return "BREAKDOWN"; case BREAK_OTHER: return "OTHER"; default: return ""; }
+}
+String breakReasonLabelShort(BreakReason r) {
+  switch(r) { case BREAK_WASHROOM: return "WASHROOM"; case BREAK_BREAKDOWN: return "BREAKDOWN"; case BREAK_OTHER: return "OTHER"; default: return ""; }
+}
+bool isInBreakMode() { return currentBreakReason!=BREAK_NONE; }
+
+void saveBreakState() {
+  Preferences p; p.begin(BREAK_NAMESPACE,false);
+  p.putInt("reason",(int)currentBreakReason); p.putULong64("startEp",(uint64_t)breakStartEpoch);
+  p.putBool("synced",breakStartedThisSession); p.end();
+}
+void loadBreakState() {
+  Preferences p; p.begin(BREAK_NAMESPACE,true);
+  currentBreakReason=(BreakReason)p.getInt("reason",0);
+  breakStartEpoch=(time_t)p.getULong64("startEp",0);
+  breakStartedThisSession=p.getBool("synced",false); p.end();
+  breakStartMillis=millis();
+}
+void clearBreakStateNVS() { Preferences p; p.begin(BREAK_NAMESPACE,false); p.clear(); p.end(); }
+
+void startBreak(BreakReason r) {
+  currentBreakReason=r; time_t now; time(&now);
+  if (now>1700000000UL) { breakStartEpoch=now; breakStartedThisSession=true; }
+  else { breakStartEpoch=0; breakStartedThisSession=false; }
+  breakStartMillis=millis(); saveBreakState();
+  logBreakEventToFirebase(r,"start",0,nullptr);
+}
+unsigned long getBreakElapsedSeconds() {
+  if (currentBreakReason==BREAK_NONE) return 0;
+  if (breakStartEpoch>0) { time_t now; time(&now); if (now>1700000000UL&&now>=breakStartEpoch) return (unsigned long)(now-breakStartEpoch); }
+  if (breakStartMillis>0) { unsigned long nm=millis(); if (nm>=breakStartMillis) return (nm-breakStartMillis)/1000UL; }
+  return 0;
+}
+void endBreak(const char* endedBy="manual") {
+  if (currentBreakReason==BREAK_NONE) return;
+  unsigned long elapsed=getBreakElapsedSeconds();
+  logBreakEventToFirebase(currentBreakReason,"end",elapsed,endedBy);
+  currentBreakReason=BREAK_NONE; breakStartEpoch=0; breakStartedThisSession=false; breakStartMillis=0;
+  clearBreakStateNVS();
+}
+String formatBreakElapsed(unsigned long sec) {
+  char buf[16]; snprintf(buf,sizeof(buf),"%02lu:%02lu:%02lu",sec/3600,(sec%3600)/60,sec%60); return String(buf);
+}
+
+// ─── Firebase ─────────────────────────────────────────────────────────────────
+void pollFirebaseOps() {
+  if (!isWiFiConnected()||machineId.length()==0) return;
+  HTTPClient http; http.begin(FIREBASE_DB_URL+"/machines/"+machineId+"/activeOps.json"); http.setTimeout(2000);
+  int code=http.GET(); if (code!=200) { http.end(); return; }
+  String response=http.getString(); http.end(); response.trim();
+  if (response==lastActiveOpsCache) return;
+  lastActiveOpsCache=response;
+  if (response=="null"||response.length()==0) {
+    int si=0,so=0; String empty[1]; setActiveOpsFromFirebase(empty,0,si,so);
+    if ((si>0||so>0)&&(millis()-lastFirebaseChangeTime>FIREBASE_CHANGE_DEBOUNCE)) {
+      lastFirebaseChangeTime=millis();
+      if (!isInBreakMode()) { showFirebaseSyncScreen(0,so); messageShowUntil=millis()+2000; messagePending=true; pendingReturnScreen=isEmployeeSignedIn?"employee":"operator"; }
+    }
+    return;
+  }
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc,response)||!doc.is<JsonArray>()) return;
+  String desired[MAX_ACTIVE_OPS]; int desiredCount=0;
+  for (JsonVariant v:doc.as<JsonArray>()) {
+    if (desiredCount>=MAX_ACTIVE_OPS) break;
+    String op=v.as<String>(); op.trim(); if (op.length()>0) desired[desiredCount++]=op;
+  }
+  bool needsUpdate=(desiredCount!=activeOpCount);
+  if (!needsUpdate) for (int i=0;i<desiredCount;i++) if (!isOpActive(desired[i])) { needsUpdate=true; break; }
+  if (needsUpdate&&(millis()-lastFirebaseChangeTime>FIREBASE_CHANGE_DEBOUNCE)) {
+    int si=0,so=0; setActiveOpsFromFirebase(desired,desiredCount,si,so);
+    if (si>0||so>0) {
+      lastFirebaseChangeTime=millis();
+      if (!isInBreakMode()) { showFirebaseSyncScreen(si,so); messageShowUntil=millis()+2000; messagePending=true; pendingReturnScreen=isEmployeeSignedIn?"employee":"operator"; }
+    }
+  }
+}
+void pushActiveOpsToFirebase() {
+  if (!isWiFiConnected()||machineId.length()==0) return;
+  String arr="["; for (int i=0;i<activeOpCount;i++) { if (i>0) arr+=","; arr+="\""+activeOperations[i]+"\""; } arr+="]";
+  String payload=(activeOpCount==0)?"null":arr;
+  HTTPClient http; http.begin(FIREBASE_DB_URL+"/machines/"+machineId+"/activeOps.json");
+  http.addHeader("Content-Type","application/json"); http.setTimeout(3000);
+  http.PUT(payload); http.end(); lastActiveOpsCache=payload;
+}
+void logBreakEventToFirebase(BreakReason reason, const char* action, unsigned long durationSec, const char* endedBy) {
+  if (reason==BREAK_NONE||!isWiFiConnected()||machineId.length()==0) return;
+  StaticJsonDocument<512> doc;
+  doc["reason"]=breakReasonLabelShort(reason); doc["reasonFull"]=breakReasonLabel(reason);
+  doc["action"]=action; doc["timestamp"]=getISOTimeIST();
+  doc["employeeId"]=currentEmployeeId; doc["employeeName"]=currentEmployeeName;
+  doc["machineId"]=machineId; doc["machineName"]=machineName; doc["deviceId"]=deviceId;
+  time_t nowEpoch; time(&nowEpoch); if (nowEpoch>1700000000UL) doc["epoch"]=(uint32_t)nowEpoch;
+  if (strcmp(action,"start")==0) { if (breakStartEpoch>0) doc["startEpoch"]=(uint32_t)breakStartEpoch; }
+  else { doc["durationSec"]=(uint32_t)durationSec; doc["durationFmt"]=formatBreakElapsed(durationSec); if (endedBy) doc["endedBy"]=endedBy; if (breakStartEpoch>0) doc["startEpoch"]=(uint32_t)breakStartEpoch; }
+  String payload; serializeJson(doc,payload);
+  HTTPClient http; http.begin(FIREBASE_DB_URL+"/machines/"+machineId+"/breakEvents.json");
+  http.addHeader("Content-Type","application/json"); http.setTimeout(3000); http.POST(payload); http.end();
+}
+
+// ─── Scanner / TFT ────────────────────────────────────────────────────────────
+HardwareSerial ScannerSerial(2);
+#define SCANNER_RX 4
+#define SCANNER_TX 2
+#define TFT_CS   25
+#define TFT_RST  33
+#define TFT_DC   26
+#define TFT_MOSI 27
+#define TFT_SCLK 14
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+
+// ─── NVS ──────────────────────────────────────────────────────────────────────
+Preferences preferences;
+const char* CONFIG_NAMESPACE   = "scanner_cfg";
+const char* EMPLOYEE_NAMESPACE = "scanner_emp";
+const char* SCANS_NAMESPACE    = "scanner_scans";
+const char* VERSION_NAMESPACE  = "firmware_ver";
+const char* MACHINE_NAMESPACE  = "scanner_mach";
+
+String scannedData = "";
+
+// ─── Employee State ───────────────────────────────────────────────────────────
+String currentEmployeeName = "";
+String currentEmployeeId   = "";
+bool isEmployeeSignedIn    = false;
+int  operatorScanCount     = 0;
+
+// ─── Scan Queue ───────────────────────────────────────────────────────────────
+struct StoredScan {
+  String scanId, timestamp, employeeId, employeeName, action, activeOps;
+  bool isEmployeeScan;
+  int retryCount;
+};
+const int MAX_STORED_SCANS = 200;
+StoredScan offlineScans[MAX_STORED_SCANS];
+int storedScanCount = 0;
+bool isSendingBulk  = false;
+
+// ─── Timers ───────────────────────────────────────────────────────────────────
+unsigned long lastHeaderRefresh = 0;
+const unsigned long HEADER_REFRESH_INTERVAL = 1000;
+const long GMT_OFFSET_SEC     = 19800;
+const int  DAYLIGHT_OFFSET_SEC = 0;
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+bool isBarcodeId(const String& id)  { return id.length()>0&&id.startsWith("WO-"); }
+bool isEmployeeId(const String& id) { return id.length()>0&&id.startsWith("GR"); }
+
+String extractEmployeeIdFromUrl(String value) {
+  if (!value.length()) return value; value.trim();
+  if (value.startsWith("http://")||value.startsWith("https://")) {
+    int ls=value.lastIndexOf('/'); if (ls>=0&&ls<(int)value.length()-1) return value.substring(ls+1);
+  }
+  return value;
+}
+bool isWiFiConnected() { return WiFi.status()==WL_CONNECTED; }
+
+String getTimeHHMM() {
+  struct tm t; if (!getLocalTime(&t)) return "--:--";
+  char buf[10]; strftime(buf,sizeof(buf),"%H:%M",&t); return String(buf);
+}
+String getISOTimeIST() {
+  struct tm t; if (!getLocalTime(&t)) return "1970-01-01T00:00:00.000+05:30";
+  char buf[40]; strftime(buf,sizeof(buf),"%Y-%m-%dT%H:%M:%S",&t); return String(buf)+".000+05:30";
+}
+
+// ─── Visual Feedback ──────────────────────────────────────────────────────────
+void showVisualFeedback(bool isSuccess, String message) {
+  visualFeedbackActive=true; visualFeedbackIsSuccess=isSuccess; visualFeedbackMessage=message;
+  visualFeedbackUntil=millis()+2000;
+  if (isSuccess) { tft.fillScreen(ST77XX_GREEN); tft.setTextColor(ST77XX_BLACK); }
+  else           { tft.fillScreen(ST77XX_RED);   tft.setTextColor(ST77XX_WHITE); }
+  tft.setTextSize(2); tft.setCursor(25,35); tft.println(isSuccess?"SUCCESS":"FAILED");
+  tft.setTextSize(1);
+  int lineY=65,startPos=0;
+  while (startPos<(int)message.length()) {
+    int endPos=min(startPos+28,(int)message.length());
+    if (endPos<(int)message.length()) { int sp=message.lastIndexOf(' ',endPos); if (sp>startPos) endPos=sp; }
+    tft.setCursor(5,lineY); tft.println(message.substring(startPos,endPos));
+    lineY+=12; startPos=endPos+1; if (lineY>100) break;
+  }
+  tft.drawFastHLine(0,20,160,ST77XX_BLUE);
+}
+
+// ─── Machine helpers ──────────────────────────────────────────────────────────
+String getMachineIdLast5() { return machineId.length()<=5?machineId:"..."+machineId.substring(machineId.length()-5); }
+String getMachineDisplay() {
+  if (machineName.length()>0) { String d=machineName; if (d.length()>20) d=d.substring(0,20); return d; }
+  if (machineId.length()>0) return machineId.length()<=5?machineId:machineId.substring(machineId.length()-5);
+  return "NO-ID";
+}
+void saveMachineName(String n) { preferences.begin(MACHINE_NAMESPACE,false); preferences.putString("mname",n); preferences.end(); machineName=n; }
+void loadMachineName() { preferences.begin(MACHINE_NAMESPACE,true); machineName=preferences.getString("mname",""); preferences.end(); }
+void clearMachineName() { machineName=""; preferences.begin(MACHINE_NAMESPACE,false); preferences.remove("mname"); preferences.end(); }
+void fetchMachineNameIfNeeded() {
+  if (machineName.length()>0||!isWiFiConnected()||machineId.length()==0) return;
+  HTTPClient http; http.begin(MACHINE_NAME_URL+machineId); http.setTimeout(5000);
+  int code=http.GET();
+  if (code==200) {
+    String body=http.getString(); http.end();
+    StaticJsonDocument<512> doc;
+    if (!deserializeJson(doc,body)) {
+      String name="";
+      if (doc.containsKey("name")) name=doc["name"].as<String>();
+      else if (doc.containsKey("machine")&&doc["machine"].containsKey("name")) name=doc["machine"]["name"].as<String>();
+      if (name.length()>0) saveMachineName(name);
+    }
+  } else { http.end(); }
+}
+void saveFirmwareVersion(String v) { preferences.begin(VERSION_NAMESPACE,false); preferences.putString("version",v); preferences.end(); currentFirmwareVersion=v; }
+void loadFirmwareVersion() { preferences.begin(VERSION_NAMESPACE,true); currentFirmwareVersion=preferences.getString("version","5.2.0"); preferences.end(); }
+
+// ─── UI ───────────────────────────────────────────────────────────────────────
+void showSplashScreen() {
+  tft.fillScreen(ST77XX_BLACK);
+  for (int i=0;i<160;i+=4) { tft.drawRect(i/2,i/4,160-i,128-i/2,ST77XX_BLUE); delay(5); }
+  tft.setTextSize(2); tft.setTextColor(ST77XX_RED); tft.setCursor(22,45); tft.println("GRAV");
+  tft.setTextColor(ST77XX_WHITE); tft.setCursor(20,43); tft.println("GRAV");
+  tft.setTextSize(1); tft.setTextColor(ST77XX_CYAN); tft.setCursor(45,70); tft.println("Scanner");
+  for (int i=0;i<120;i+=10) { tft.drawLine(20,90,20+i,90,ST77XX_GREEN); delay(50); }
+  tft.setTextColor(ST77XX_YELLOW); tft.setCursor(30,105); tft.println("v"+currentFirmwareVersion);
+  delay(1500); tft.fillScreen(ST77XX_BLACK);
+}
+void drawWiFiIconSmall(bool connected) {
+  int bX=152,bY=15; tft.fillRect(140,0,20,18,ST77XX_BLACK);
+  if (connected) { tft.fillRect(bX-10,bY-3,3,3,ST77XX_GREEN); tft.fillRect(bX-6,bY-6,3,6,ST77XX_GREEN); tft.fillRect(bX-2,bY-9,3,9,ST77XX_GREEN); }
+  else { tft.drawLine(bX-10,5,bX,15,ST77XX_RED); tft.drawLine(bX,5,bX-10,15,ST77XX_RED); }
+}
+void drawHeader() {
+  tft.fillRect(0,0,160,18,ST77XX_BLACK);
+  tft.setTextSize(1); tft.setTextColor(ST77XX_YELLOW); tft.setCursor(4,5); tft.print(getMachineDisplay());
+  drawWiFiIconSmall(isWiFiConnected()); tft.drawFastHLine(0,18,160,ST77XX_BLUE);
+}
+void showScreen(String title, String line1, String line2, int bgColor=ST77XX_BLACK) {
+  tft.fillScreen(bgColor); drawHeader();
+  tft.setTextColor(ST77XX_CYAN); tft.setTextSize(1); tft.setCursor(5,30); tft.println(title);
+  tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,50); tft.println(line1);
+  tft.setTextColor(ST77XX_YELLOW); tft.setCursor(5,70); tft.println(line2);
+}
+void showMessageNB(String line1, String line2) {
+  tft.fillRect(0,20,160,100,ST77XX_BLACK);
+  tft.setTextColor(ST77XX_CYAN); tft.setTextSize(1); tft.setCursor(5,40); tft.println(line1);
+  tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,60); tft.println(line2);
+}
+void showInfoScreen() {
+  tft.fillScreen(ST77XX_BLACK); drawHeader();
+  tft.setTextColor(ST77XX_GREEN); tft.setTextSize(1); tft.setCursor(5,25); tft.println("DEVICE INFO");
+  tft.setTextColor(ST77XX_CYAN); tft.setCursor(5,38); tft.println("Machine:");
+  tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,48); tft.println(machineName.length()>0?machineName:(machineId.length()>0?getMachineIdLast5():"Not Set"));
+  tft.setTextColor(ST77XX_CYAN); tft.setCursor(5,60); tft.println("Device ID:");
+  tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,70); tft.println(deviceId);
+  tft.setTextColor(ST77XX_CYAN); tft.setCursor(5,82); tft.println("WiFi:");
+  tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,92); tft.println(wifiSSID.length()>0?wifiSSID:"Not Configured");
+  tft.setTextColor(ST77XX_CYAN); tft.setCursor(5,104); tft.println("Firmware:");
+  tft.setTextColor(ST77XX_YELLOW); tft.setCursor(5,114); tft.println("v"+currentFirmwareVersion);
+}
+void showOpsOnScreen(int startY) {
+  if (activeOpCount==0) return;
+  String allOps=""; for (int i=0;i<activeOpCount;i++) { if (i>0) allOps+=", "; allOps+=activeOperations[i]; }
+  tft.setTextSize(1); tft.setTextColor(ST77XX_MAGENTA); tft.setCursor(5,startY); tft.print("Ops:");
+  const int MAX_CHARS=25; int lineY=startY,pos=0,len=allOps.length(); bool firstChunk=true;
+  while (pos<len) {
+    int remaining=len-pos,take=(remaining>MAX_CHARS)?MAX_CHARS:remaining;
+    if (pos+take<len) { int bA=-1; for (int k=pos+take-1;k>pos;k--) if (allOps.charAt(k)==' ') { bA=k; break; } if (bA>pos) take=bA-pos+1; }
+    String chunk=allOps.substring(pos,pos+take); chunk.trim();
+    if (firstChunk) { tft.setTextColor(ST77XX_WHITE); tft.print(" "); tft.print(chunk); firstChunk=false; lineY+=10; }
+    else { tft.setCursor(5,lineY); tft.setTextColor(ST77XX_WHITE); tft.print(chunk); lineY+=10; }
+    pos+=take; if (lineY>startY+45) break;
+  }
+}
+void showOpsToggleScreen(String opName, bool signedin) {
+  tft.fillRect(0,20,160,108,ST77XX_BLACK); drawHeader();
+  if (signedin) { tft.setTextColor(ST77XX_GREEN); tft.setCursor(5,30); tft.println("OP SIGN-IN:"); }
+  else          { tft.setTextColor(ST77XX_RED);   tft.setCursor(5,30); tft.println("OP SIGN-OUT:"); }
+  tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,42);
+  String op=opName; if (op.length()>22) op=op.substring(0,22); tft.println(op);
+  tft.setTextColor(ST77XX_CYAN); tft.setCursor(5,54); tft.println("Active: "+String(activeOpCount));
+  showOpsOnScreen(65);
+}
+void showGroupOpsToggleScreen(int count, int si, int so) {
+  tft.fillRect(0,20,160,108,ST77XX_BLACK); drawHeader();
+  tft.setTextColor(ST77XX_CYAN); tft.setCursor(5,28); tft.println("GROUP OPS ("+String(count)+"):");
+  tft.setTextColor(ST77XX_GREEN); tft.setCursor(5,40); tft.print("+"+String(si)+" in  ");
+  tft.setTextColor(ST77XX_RED); tft.print("-"+String(so)+" out");
+  tft.setTextColor(ST77XX_CYAN); tft.setCursor(5,52); tft.println("Active: "+String(activeOpCount));
+  showOpsOnScreen(63);
+}
+void showFirebaseSyncScreen(int si, int so) {
+  tft.fillRect(0,20,160,108,ST77XX_BLACK); drawHeader();
+  tft.setTextColor(ST77XX_YELLOW); tft.setCursor(5,28); tft.println("CMS SYNC:");
+  tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,40); tft.println("Ops updated from app");
+  if (si>0) { tft.setTextColor(ST77XX_GREEN); tft.setCursor(5,52); tft.println("+"+String(si)+" signed in"); }
+  if (so>0) { tft.setTextColor(ST77XX_RED);   tft.setCursor(5,62); tft.println("-"+String(so)+" signed out"); }
+  tft.setTextColor(ST77XX_CYAN); tft.setCursor(5,74); tft.println("Active: "+String(activeOpCount));
+  showOpsOnScreen(85);
+}
+void drawNameLine(int y, uint16_t bg) {
+  bool onY=(bg==ST77XX_YELLOW); tft.setTextSize(1); tft.setCursor(5,y);
+  tft.setTextColor(onY?ST77XX_BLACK:ST77XX_GREEN); tft.print("ID: ");
+  String nm=currentEmployeeId; if ((int)nm.length()>20) nm=nm.substring(0,18)+"..";
+  tft.setTextColor(onY?ST77XX_BLACK:ST77XX_WHITE); tft.print(nm);
+}
+void showEmployeeScreen() {
+  tft.fillScreen(ST77XX_BLACK); drawHeader();
+  drawNameLine(28,ST77XX_BLACK);
+  tft.setTextColor(ST77XX_CYAN); tft.setTextSize(1); tft.setCursor(5,40); tft.print("Scans today: ");
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.print(operatorScanCount);
+  showOpsOnScreen(56);
+  if (updateAvailable) { tft.setTextColor(ST77XX_YELLOW); tft.setCursor(5,118); tft.println("Upd: v"+newFirmwareVersion); }
+}
+void showNoOperatorScreen() {
+  tft.fillScreen(ST77XX_BLACK); drawHeader();
+  tft.setTextColor(ST77XX_RED); tft.setTextSize(1); tft.setCursor(5,35); tft.println("NO OPERATOR");
+  tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,50); tft.println("Scan ID card to begin");
+  showOpsOnScreen(65);
+}
+
+// ─── Spinner ──────────────────────────────────────────────────────────────────
+static void drawSpinnerFrame(int head) {
+  const int cx=80,cy=76,R=22,dotR=3,N=8;
+  tft.fillRect(cx-R-dotR-1,cy-R-dotR-1,2*(R+dotR+1),2*(R+dotR+1),SPINNER_BG);
+  for (int i=0;i<N;i++) {
+    float angle=((float)i/(float)N)*2.0f*PI-(PI/2.0f);
+    int x=cx+(int)(cos(angle)*R),y=cy+(int)(sin(angle)*R);
+    int dist=(i-head+N)%N; uint16_t col;
+    switch(dist) { case 0:col=ST77XX_WHITE;break; case 1:col=tft.color565(210,210,230);break; case 2:col=tft.color565(140,140,170);break; case 3:col=tft.color565(80,80,110);break; default:col=tft.color565(40,40,65);break; }
+    tft.fillCircle(x,y,dotR,col);
+  }
+}
+static void spinnerTaskFn(void*) { int head=0; while (spinnerRunning) { drawSpinnerFrame(head); head=(head+1)%8; vTaskDelay(pdMS_TO_TICKS(110)); } vTaskDelete(NULL); }
+void startSpinner() {
+  if (spinnerRunning) return;
+  tft.fillScreen(SPINNER_BG); tft.fillRect(0,0,160,18,ST77XX_BLACK);
+  tft.setTextSize(1); tft.setTextColor(ST77XX_YELLOW); tft.setCursor(4,5); tft.print(getMachineDisplay());
+  drawWiFiIconSmall(isWiFiConnected()); tft.drawFastHLine(0,18,160,ST77XX_BLUE);
+  spinnerRunning=true; xTaskCreatePinnedToCore(spinnerTaskFn,"spin",2048,NULL,1,&spinnerTaskHandle,0);
+}
+void stopSpinner() { if (!spinnerRunning) return; spinnerRunning=false; delay(160); spinnerTaskHandle=NULL; }
+
+// ─── Break Screen ─────────────────────────────────────────────────────────────
+void refreshBreakTimerArea() {
+  tft.fillRect(0,72,160,28,ST77XX_YELLOW); tft.setTextSize(2); tft.setTextColor(ST77XX_BLACK);
+  tft.setCursor(5,78); tft.print(formatBreakElapsed(getBreakElapsedSeconds()));
+}
+void showBreakScreen() {
+  tft.fillScreen(ST77XX_YELLOW); tft.setTextSize(1); tft.setTextColor(ST77XX_BLACK); tft.setCursor(4,5); tft.print(getMachineDisplay());
+  int bX=152,bY=15;
+  if (isWiFiConnected()) { tft.fillRect(bX-10,bY-3,3,3,ST77XX_BLUE); tft.fillRect(bX-6,bY-6,3,6,ST77XX_BLUE); tft.fillRect(bX-2,bY-9,3,9,ST77XX_BLUE); }
+  else { tft.drawLine(bX-10,5,bX,15,ST77XX_RED); tft.drawLine(bX,5,bX-10,15,ST77XX_RED); }
+  tft.drawFastHLine(0,18,160,ST77XX_BLACK); drawNameLine(22,ST77XX_YELLOW);
+  tft.setTextColor(ST77XX_BLACK); tft.setTextSize(1); tft.setCursor(5,34); tft.print("Scans: "); tft.print(operatorScanCount);
+  tft.setTextSize(2); tft.setTextColor(ST77XX_RED); tft.setCursor(5,50); tft.print("["); tft.print(breakReasonLabelShort(currentBreakReason)); tft.print("]");
+  refreshBreakTimerArea();
+  tft.setTextSize(1); tft.setTextColor(ST77XX_BLACK); tft.setCursor(5,105); tft.print("Scan same = end"); tft.setCursor(5,117); tft.print("Scan other = resume");
+}
+void returnToHomeScreen() {
+  if (isInBreakMode()) { showBreakScreen(); lastBreakScreenRefresh=millis(); }
+  else if (isEmployeeSignedIn) showEmployeeScreen();
+  else showNoOperatorScreen();
+}
+
+// ─── OTA ──────────────────────────────────────────────────────────────────────
+void showUpdateScreen(String status, int progress=-1) {
+  tft.fillScreen(ST77XX_BLACK); drawHeader();
+  tft.setTextColor(ST77XX_YELLOW); tft.setTextSize(1); tft.setCursor(5,30); tft.println("FIRMWARE UPDATE");
+  tft.setTextColor(ST77XX_CYAN); tft.setCursor(5,50); tft.println("v"+currentFirmwareVersion+"->v"+newFirmwareVersion);
+  tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,70); tft.println(status);
+  if (progress>=0) { int bW=140,bX=10,bY=90; tft.drawRect(bX,bY,bW,10,ST77XX_WHITE); tft.fillRect(bX,bY,(progress*bW)/100,10,ST77XX_GREEN); tft.setCursor(bX+60,bY+15); tft.print(String(progress)+"%"); }
+}
+void reconcileBreakEpochIfNeeded() {
+  if (currentBreakReason==BREAK_NONE||breakStartEpoch>0) return;
+  time_t now; time(&now); if (now>1700000000UL) { breakStartEpoch=now; breakStartedThisSession=true; saveBreakState(); }
+}
+bool checkForUpdates() {
+  if (!isWiFiConnected()||deviceId.length()==0) return false;
+  HTTPClient http; http.begin(DEVICE_REGISTER_URL); http.addHeader("Content-Type","application/json"); http.setTimeout(10000);
+  StaticJsonDocument<384> doc; doc["deviceId"]=deviceId; doc["machineId"]=machineId; doc["currentVersion"]=currentFirmwareVersion; doc["ipAddress"]=WiFi.localIP().toString(); doc["wifiSSID"]=wifiSSID;
+  String body; serializeJson(doc,body); int code=http.POST(body);
+  if (code==200) {
+    String resp=http.getString(); http.end(); StaticJsonDocument<1024> r;
+    if (!deserializeJson(r,resp)) {
+      bool upd=r["updateAvailable"]|false;
+      if (upd&&r.containsKey("firmware")) { JsonObject fw=r["firmware"]; newFirmwareVersion=fw["version"].as<String>(); newFirmwareUrl=fw["url"].as<String>(); if (newFirmwareVersion.length()>0&&newFirmwareUrl.length()>0) { updateAvailable=true; return true; } }
+      else { updateAvailable=false; }
+    }
+  } else { http.end(); }
+  return false;
+}
+bool performOTAUpdate() {
+  if (!updateAvailable||newFirmwareUrl.length()==0) return false;
+  showUpdateScreen("Connecting...",0); HTTPClient http; http.begin(newFirmwareUrl); http.setTimeout(30000); int code=http.GET();
+  if (code!=200) { showMessageNB("Update Failed","HTTP "+String(code)); delay(3000); http.end(); return false; }
+  int cl=http.getSize(); if (cl<=0) { showMessageNB("Update Failed","Invalid size"); delay(3000); http.end(); return false; }
+  if (!Update.begin(cl)) { showMessageNB("Update Failed","No space"); delay(3000); http.end(); return false; }
+  WiFiClient* stream=http.getStreamPtr(); size_t written=0; int lastProg=0;
+  while (written<(size_t)cl) { size_t av=stream->available(); if (av) { uint8_t buf[256]; size_t rd=stream->readBytes(buf,min(av,sizeof(buf))); written+=Update.write(buf,rd); int prog=(written*100)/cl; if (prog>=lastProg+5) { showUpdateScreen("Downloading...",prog); lastProg=prog; } } delay(1); }
+  if (Update.end()) { showUpdateScreen("Installing...",100); delay(2000); saveFirmwareVersion(newFirmwareVersion); return true; }
+  showMessageNB("Update Failed",Update.errorString()); delay(3000); http.end(); return false;
+}
+
+// ─── NVS: Config ──────────────────────────────────────────────────────────────
+void saveConfig(String ssid, String pass, String mId, String mName="") {
+  preferences.begin(CONFIG_NAMESPACE,false);
+  preferences.putString("wifi_ssid",ssid); preferences.putString("wifi_pass",pass); preferences.putString("machine_id",mId);
+  preferences.putBool("wifi_configured",true); preferences.putBool("machine_configured",true); preferences.end();
+  wifiSSID=ssid; wifiPass=pass; machineId=mId; wifiConfigured=true; machineIdConfigured=true;
+  if (mName.length()>0) saveMachineName(mName); else clearMachineName();
+  lastActiveOpsCache="";
+}
+void loadConfig() {
+  preferences.begin(CONFIG_NAMESPACE,true);
+  wifiSSID=preferences.getString("wifi_ssid",""); wifiPass=preferences.getString("wifi_pass",""); machineId=preferences.getString("machine_id","");
+  uint64_t chipid=ESP.getEfuseMac(); deviceId=String((uint32_t)chipid,HEX); deviceId.toUpperCase();
+  while (deviceId.length()<8) deviceId="0"+deviceId; if (deviceId.length()>8) deviceId=deviceId.substring(deviceId.length()-8);
+  wifiConfigured=preferences.getBool("wifi_configured",false); machineIdConfigured=preferences.getBool("machine_configured",false); preferences.end();
+}
+void clearConfig() { preferences.begin(CONFIG_NAMESPACE,false); preferences.clear(); preferences.end(); clearMachineName(); }
+
+// ─── NVS: Employee ────────────────────────────────────────────────────────────
+void saveEmployeeData() {
+  preferences.begin(EMPLOYEE_NAMESPACE,false);
+  preferences.putString("empName",currentEmployeeName); preferences.putString("empId",currentEmployeeId);
+  preferences.putBool("empSignedIn",isEmployeeSignedIn); preferences.putInt("empScanCount",operatorScanCount);
+  preferences.end();
+}
+void loadEmployeeData() {
+  preferences.begin(EMPLOYEE_NAMESPACE,true);
+  currentEmployeeName=preferences.getString("empName",""); currentEmployeeId=preferences.getString("empId","");
+  isEmployeeSignedIn=preferences.getBool("empSignedIn",false); operatorScanCount=preferences.getInt("empScanCount",0);
+  preferences.end();
+  if (currentEmployeeName.isEmpty()) { isEmployeeSignedIn=false; currentEmployeeId=""; operatorScanCount=0; }
+}
+void clearEmployeeData() {
+  currentEmployeeName=""; currentEmployeeId=""; isEmployeeSignedIn=false; operatorScanCount=0;
+  preferences.begin(EMPLOYEE_NAMESPACE,false); preferences.clear(); preferences.end();
+}
+
+// ─── NVS: Scans ───────────────────────────────────────────────────────────────
+void saveScansData() {
+  preferences.begin(SCANS_NAMESPACE,false); preferences.putInt("storedCount",storedScanCount);
+  for (int i=0;i<storedScanCount;i++) {
+    String p="scan"+String(i);
+    preferences.putString((p+"id").c_str(),offlineScans[i].scanId); preferences.putString((p+"ts").c_str(),offlineScans[i].timestamp);
+    preferences.putBool((p+"isEmp").c_str(),offlineScans[i].isEmployeeScan); preferences.putString((p+"empId").c_str(),offlineScans[i].employeeId);
+    preferences.putString((p+"empName").c_str(),offlineScans[i].employeeName); preferences.putString((p+"action").c_str(),offlineScans[i].action);
+    preferences.putString((p+"ops").c_str(),offlineScans[i].activeOps);
+  }
+  preferences.end();
+}
+void loadScansData() {
+  preferences.begin(SCANS_NAMESPACE,true); storedScanCount=preferences.getInt("storedCount",0);
+  if (storedScanCount>MAX_STORED_SCANS) storedScanCount=MAX_STORED_SCANS;
+  for (int i=0;i<storedScanCount;i++) {
+    String p="scan"+String(i);
+    offlineScans[i].scanId=preferences.getString((p+"id").c_str(),""); offlineScans[i].timestamp=preferences.getString((p+"ts").c_str(),"");
+    offlineScans[i].isEmployeeScan=preferences.getBool((p+"isEmp").c_str(),false); offlineScans[i].employeeId=preferences.getString((p+"empId").c_str(),"");
+    offlineScans[i].employeeName=preferences.getString((p+"empName").c_str(),""); offlineScans[i].action=preferences.getString((p+"action").c_str(),"");
+    offlineScans[i].activeOps=preferences.getString((p+"ops").c_str(),""); offlineScans[i].retryCount=0;
+  }
+  preferences.end();
+}
+void clearScansData() { storedScanCount=0; preferences.begin(SCANS_NAMESPACE,false); preferences.clear(); preferences.end(); }
+
+// ─── Periodic NVS Persist ─────────────────────────────────────────────────────
+void persistNVS() {
+  if (!nvsDirty) return;
+  saveScansData(); saveWOHistory(); saveEmployeeData();
+  nvsDirty=false;
+  Serial.println("[NVS] Flushed");
+}
+
+// ─── Memory Wipe ──────────────────────────────────────────────────────────────
+void wipeAllMemory() {
+  endBreak("wipe"); clearEmployeeData(); clearScansData(); clearWOHistory(); clearConfig(); clearMachineName();
+  activeOpCount=0; for (int i=0;i<MAX_ACTIVE_OPS;i++) activeOperations[i]="";
+  lastActiveOpsCache=""; wifiSSID=""; wifiPass=""; machineId=""; machineName=""; wifiConfigured=false; machineIdConfigured=false; nvsDirty=false;
+}
+
+// ─── WiFi Update Barcode Handler ──────────────────────────────────────────────
+void handleWiFiUpdateBarcode(const String& s) {
+  String newSSID, newPass;
+  if (!parseWiFiUpdateBarcode(s,newSSID,newPass)) { showVisualFeedback(false,"Bad WiFi barcode"); scanFeedbackUntil=millis()+2000; return; }
+  tft.fillScreen(ST77XX_BLACK); drawHeader();
+  tft.setTextColor(ST77XX_YELLOW); tft.setTextSize(1); tft.setCursor(5,28); tft.println("WIFI UPDATE");
+  tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,42); tft.println("SSID: "+newSSID);
+  tft.setTextColor(ST77XX_CYAN); tft.setCursor(5,56); tft.println("Connecting...");
+  preferences.begin(CONFIG_NAMESPACE,false);
+  preferences.putString("wifi_ssid",newSSID); preferences.putString("wifi_pass",newPass);
+  preferences.putBool("wifi_configured",true); preferences.end();
+  wifiSSID=newSSID; wifiPass=newPass; wifiConfigured=true;
+  WiFi.disconnect(); delay(500); WiFi.mode(WIFI_STA); WiFi.begin(newSSID.c_str(),newPass.c_str());
+  int attempts=0; while (WiFi.status()!=WL_CONNECTED&&attempts<20) { delay(500); attempts++; }
+  if (WiFi.status()==WL_CONNECTED) {
+    wifiConnectionFailCount=0; lastWiFiState=true;
+    // Indian NTP server — faster sync from India
+    configTime(GMT_OFFSET_SEC,DAYLIGHT_OFFSET_SEC,"in.pool.ntp.org","pool.ntp.org","time.nist.gov");
+    for (int i=0;i<50;i++) { time_t n; time(&n); if (n>1700000000UL) break; delay(200); }
+    tft.fillScreen(ST77XX_BLACK); drawHeader();
+    tft.setTextColor(ST77XX_GREEN); tft.setTextSize(1); tft.setCursor(5,35); tft.println("WiFi Updated!");
+    tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,50); tft.println("SSID: "+newSSID);
+    tft.setTextColor(ST77XX_CYAN); tft.setCursor(5,65); tft.println("Connected");
+    tft.setTextColor(ST77XX_YELLOW); tft.setCursor(5,80); tft.println(WiFi.localIP().toString());
+    delay(2500); if (storedScanCount>0) sendBatchNow=true; checkForUpdates(); pollFirebaseOps();
+  } else {
+    tft.fillScreen(ST77XX_BLACK); drawHeader();
+    tft.setTextColor(ST77XX_RED); tft.setTextSize(1); tft.setCursor(5,35); tft.println("WiFi Failed");
+    tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,50); tft.println("SSID: "+newSSID);
+    tft.setTextColor(ST77XX_YELLOW); tft.setCursor(5,65); tft.println("Check credentials"); delay(3000);
+  }
+  messageShowUntil=millis()+100; messagePending=true; pendingReturnScreen=isEmployeeSignedIn?"employee":"operator";
+}
+
+// ─── WiFi Manager HTML ────────────────────────────────────────────────────────
+void handleRoot() {
+  String html = R"rawliteral(<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{font-family:Arial;background:#f2f4f7;margin:0;padding:20px}.container{max-width:420px;margin:0 auto;background:white;padding:25px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.08)}h2{margin-top:0;color:#222;text-align:center}h3{color:#444;margin:15px 0 5px;font-size:16px}input,select{width:100%;padding:12px;margin:6px 0;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;font-size:14px}.pw-wrap{position:relative;margin:6px 0}.pw-wrap input{margin:0;padding-right:44px}.eye-btn{position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:18px;padding:0;width:32px;height:32px}.primary-btn{background:#4CAF50;color:white;padding:14px;border:none;border-radius:6px;cursor:pointer;width:100%;font-size:16px;margin-top:10px}.primary-btn:disabled{background:#aaa;cursor:not-allowed}.status{margin-top:15px;padding:10px;border-radius:6px;display:none}.success{background:#d4edda;color:#155724;display:block}.error{background:#f8d7da;color:#721c24;display:block}.info{background:#e7f3ff;color:#004085;display:block}.note{font-size:12px;color:#666;margin-top:6px;background:#f8f9fa;border-left:3px solid #4CAF50;padding:8px 10px;border-radius:4px}.divider{border-top:1px solid #eee;margin:20px 0 10px}#scanStatus{font-size:12px;color:#888;margin:4px 0}</style>
+</head><body><div class="container"><h2>&#9881; GRAV Scanner Setup</h2>
+<h3>1. WiFi Network</h3><div id="scanStatus">Scanning...</div>
+<select id="ssidDropdown" onchange="onDropdownSelect(this)"><option value="">-- Scanning... --</option></select>
+<input type="text" id="ssid" placeholder="WiFi SSID" required>
+<div class="pw-wrap"><input type="password" id="password" placeholder="WiFi Password"><button class="eye-btn" type="button" onclick="togglePw()">&#128065;</button></div>
+<h3>2. Machine Details</h3>
+<input type="text" id="machineId" placeholder="Machine ID" required>
+<input type="text" id="machineName" placeholder="Machine Name (optional)">
+<button class="primary-btn" id="saveBtn" onclick="saveConfig()">Save &amp; Connect</button>
+<div class="divider"></div>
+<div class="note">&#128273; WiFi update barcode: <b>SSID:NetworkName,PASSWORD:YourPass</b></div>
+<div class="note">&#8505; Info screen: scan <b>INFO_ADMIN_2790</b></div>
+<div id="status" class="status"></div></div>
+<script>
+var pwVisible=false;
+function togglePw(){pwVisible=!pwVisible;var i=document.getElementById('password');i.type=pwVisible?'text':'password';document.querySelector('.eye-btn').innerHTML=pwVisible?'&#128584;':'&#128065;';}
+function loadExistingConfig(){fetch('/status').then(r=>r.json()).then(d=>{if(d.ssid)document.getElementById('ssid').value=d.ssid;if(d.machineId)document.getElementById('machineId').value=d.machineId;if(d.machineName)document.getElementById('machineName').value=d.machineName;if(d.configured){var s=document.getElementById('status');s.className='status info';s.innerHTML='Config loaded. Enter password to update.';s.style.display='block';}}).catch(function(){});}
+function scanNetworks(){document.getElementById('scanStatus').textContent='Scanning...';fetch('/scan').then(r=>r.json()).then(d=>{if(d.status==='scanning'){setTimeout(scanNetworks,3000);return;}var dd=document.getElementById('ssidDropdown'),cur=document.getElementById('ssid').value;if(d.networks&&d.networks.length>0){var h='<option value="">-- Select Network --</option>';d.networks.forEach(function(n){var s=(n.ssid===cur)?' selected':'';var b=n.rssi>-60?'&#9608;&#9608;&#9608;':n.rssi>-75?'&#9608;&#9608;&#9617;':'&#9608;&#9617;&#9617;';h+='<option value="'+n.ssid+'"'+s+'>'+b+' '+n.ssid+' ('+n.rssi+'dBm)</option>';});dd.innerHTML=h;document.getElementById('scanStatus').textContent='Found '+d.networks.length+' network(s).';if(cur)dd.value=cur;}else{dd.innerHTML='<option value="">-- No networks --</option>';document.getElementById('scanStatus').textContent='None found. Enter manually.';}}).catch(function(){document.getElementById('scanStatus').textContent='Scan failed.';});}
+function onDropdownSelect(s){if(s.value)document.getElementById('ssid').value=s.value;}
+function saveConfig(){var ssid=document.getElementById('ssid').value.trim();var password=document.getElementById('password').value;var machineId=document.getElementById('machineId').value.trim();var machineName=document.getElementById('machineName').value.trim();if(!ssid){alert('Enter WiFi SSID');return;}if(!machineId){alert('Enter Machine ID');return;}var btn=document.getElementById('saveBtn');btn.disabled=true;btn.textContent='Saving...';var s=document.getElementById('status');s.className='status info';s.innerHTML='Saving...';s.style.display='block';fetch('/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(ssid)+'&password='+encodeURIComponent(password)+'&machineId='+encodeURIComponent(machineId)+'&machineName='+encodeURIComponent(machineName)}).then(r=>r.json()).then(d=>{if(d.success){s.className='status success';s.innerHTML='Saved! ID: <b>'+d.deviceId+'</b>. Restarting...';}else{s.className='status error';s.innerHTML='Error: '+d.message;btn.disabled=false;btn.textContent='Save & Connect';}}).catch(function(e){s.className='status error';s.innerHTML='Failed: '+e;btn.disabled=false;btn.textContent='Save & Connect';});}
+window.onload=function(){loadExistingConfig();scanNetworks();};
+</script></body></html>)rawliteral";
+  server.send(200,"text/html",html);
+}
+void handleScan() {
+  int n=WiFi.scanComplete();
+  if (n==-2) { WiFi.scanNetworks(true); server.send(202,"application/json","{\"status\":\"scanning\"}"); }
+  else if (n>=0) {
+    String j="{\"networks\":["; for (int i=0;i<n;++i) { if(i)j+=","; j+="{\"ssid\":\""+WiFi.SSID(i)+"\",\"rssi\":"+String(WiFi.RSSI(i))+"}"; }
+    j+="]}"; server.send(200,"application/json",j); WiFi.scanDelete();
+  } else server.send(200,"application/json","{\"networks\":[]}");
+}
+void handleSave() {
+  if (!server.hasArg("ssid")||!server.hasArg("machineId")) { server.send(400,"application/json","{\"success\":false,\"message\":\"Missing params\"}"); return; }
+  String ssid=server.arg("ssid"),pass=server.arg("password"),mId=server.arg("machineId"),mName=server.hasArg("machineName")?server.arg("machineName"):"";
+  if (ssid.length()==0||mId.length()==0) { server.send(400,"application/json","{\"success\":false,\"message\":\"Empty field\"}"); return; }
+  String nd=String((uint32_t)ESP.getEfuseMac(),HEX); nd.toUpperCase();
+  while (nd.length()<8) nd="0"+nd; if (nd.length()>8) nd=nd.substring(nd.length()-8);
+  saveConfig(ssid,pass,mId,mName);
+  server.send(200,"application/json","{\"success\":true,\"deviceId\":\""+nd+"\"}");
+  delay(1000); ESP.restart();
+}
+void handleStatus() {
+  String j="{\"configured\":"+String(wifiConfigured?"true":"false")+",\"connected\":"+String(isWiFiConnected()?"true":"false")+",\"ssid\":\""+wifiSSID+"\",\"deviceId\":\""+deviceId+"\",\"machineId\":\""+machineId+"\",\"machineName\":\""+machineName+"\",\"ip\":\""+WiFi.localIP().toString()+"\"}";
+  server.send(200,"application/json",j);
+}
+void startConfigMode() {
+  inConfigMode=true; configModeStartTime=millis(); clearMachineName(); activeOpCount=0;
+  WiFi.disconnect(); delay(500);
+  uint64_t chipid=ESP.getEfuseMac(); String chipId=String((uint32_t)chipid,HEX);
+  fullAP_SSID=String(AP_SSID)+"-"+chipId.substring(chipId.length()-4);
+  WiFi.mode(WIFI_AP_STA); WiFi.softAP(fullAP_SSID.c_str(),AP_PASSWORD);
+  IPAddress apIP=WiFi.softAPIP();
+  dnsServer.start(DNS_PORT,"*",apIP);
+  server.on("/",handleRoot); server.on("/scan",handleScan); server.on("/save",HTTP_POST,handleSave); server.on("/status",handleStatus);
+  server.onNotFound([](){server.sendHeader("Location","http://"+WiFi.softAPIP().toString(),true);server.send(302,"text/plain","");});
+  server.begin(); WiFi.scanNetworks(true);
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextColor(ST77XX_CYAN); tft.setTextSize(1); tft.setCursor(5,18); tft.println("SETUP MODE");
+  tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,32); tft.println("WiFi: "+fullAP_SSID);
+  tft.setTextColor(ST77XX_YELLOW); tft.setCursor(5,46); tft.println("Pass: "+String(AP_PASSWORD));
+  tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,62); tft.println("Open browser:");
+  tft.setTextColor(ST77XX_GREEN); tft.setCursor(5,76); tft.println(apIP.toString());
+  tft.setTextColor(ST77XX_CYAN); tft.setCursor(5,92); tft.println("Timeout: 5 min");
+}
+
+// ─── WiFi Connect ─────────────────────────────────────────────────────────────
+void connectToWiFi() {
+  if (!wifiConfigured||wifiSSID.length()==0) { startConfigMode(); return; }
+  showScreen("Connecting","SSID: "+wifiSSID,"Machine: "+getMachineDisplay());
+  WiFi.mode(WIFI_STA); WiFi.begin(wifiSSID.c_str(),wifiPass.c_str());
+  int attempts=0; while (WiFi.status()!=WL_CONNECTED&&attempts<30) { delay(1000); attempts++; }
+  if (WiFi.status()==WL_CONNECTED) {
+    wifiConnectionFailCount=0;
+    // FIXED: Indian NTP server first + wait up to 10 seconds (was 2s)
+    configTime(GMT_OFFSET_SEC,DAYLIGHT_OFFSET_SEC,"in.pool.ntp.org","pool.ntp.org","time.nist.gov");
+    fetchMachineNameIfNeeded();
+    for (int i=0;i<50;i++) { time_t n; time(&n); if (n>1700000000UL) break; delay(200); }
+    reconcileBreakEpochIfNeeded(); showMessageNB("Connected!","Machine: "+getMachineDisplay()); delay(2000);
+    checkForUpdates(); pollFirebaseOps(); if (storedScanCount>0) sendBatchNow=true;
+  } else { wifiConnectionFailCount++; showMessageNB("Connection Failed","Will retry every 30s"); delay(2000); }
+}
+
+// ─── WiFi Monitor ─────────────────────────────────────────────────────────────
+void checkWiFiConnection() {
+  if (!wifiConfigured||wifiSSID.length()==0||inConfigMode) return;
+  unsigned long now=millis(); bool cur=isWiFiConnected();
+  if (lastWiFiState!=cur) {
+    if (cur) { fetchMachineNameIfNeeded(); reconcileBreakEpochIfNeeded(); checkForUpdates(); pollFirebaseOps(); if (storedScanCount>0) sendBatchNow=true; }
+    lastWiFiState=cur;
+  }
+  if (!cur&&(now-lastWiFiConnectionAttempt)>WIFI_CONNECTION_RETRY_INTERVAL) { lastWiFiConnectionAttempt=now; wifiConnectionFailCount++; WiFi.reconnect(); }
+  if (cur) {
+    wifiConnectionFailCount=0;
+    if (now-lastUpdateCheck>UPDATE_CHECK_INTERVAL) { lastUpdateCheck=now; checkForUpdates(); }
+    if ((now-lastFirebasePoll)>FIREBASE_POLL_INTERVAL) { lastFirebasePoll=now; pollFirebaseOps(); }
+  }
+}
+
+// ─── Queue ────────────────────────────────────────────────────────────────────
+void addToOfflineStorage(String scanId, String timestamp, bool isEmp,
+                         String empId="", String empName="", String action="", String ops="") {
+  if (storedScanCount<MAX_STORED_SCANS) {
+    offlineScans[storedScanCount]={scanId,timestamp,empId,empName,action,ops,isEmp,0}; storedScanCount++;
+  } else {
+    for (int i=0;i<MAX_STORED_SCANS-1;i++) offlineScans[i]=offlineScans[i+1];
+    offlineScans[MAX_STORED_SCANS-1]={scanId,timestamp,empId,empName,action,ops,isEmp,0};
+  }
+  nvsDirty=true;
+}
+
+// ─── Bulk Send ────────────────────────────────────────────────────────────────
+bool sendBulkScans() {
+  if (!isWiFiConnected()||storedScanCount==0||isSendingBulk) return false;
+  isSendingBulk=true; int totalToSend=storedScanCount;
+  showScreen("Syncing",String(totalToSend)+" events","Please wait..."); startSpinner();
+  HTTPClient http; http.begin(BULK_API_URL); http.addHeader("Content-Type","application/json"); http.addHeader("Accept","application/json"); http.setTimeout(20000);
+  String rb="{\"scans\":[";
+  for (int i=0;i<storedScanCount;i++) {
+    if (i>0) rb+=",";
+    // FIXED: sanitize bad timestamps before sending
+    String ts=offlineScans[i].timestamp;
+    if (ts.indexOf("1969")>=0||ts.indexOf("1970")>=0||ts.length()<10) ts=getISOTimeIST();
+    rb+="{\"scanId\":\""+offlineScans[i].scanId+"\",\"machineId\":\""+machineId+"\",\"deviceId\":\""+deviceId+"\"";
+    rb+=",\"timeStamp\":\""+ts+"\",\"activeOps\":\""+offlineScans[i].activeOps+"\"";
+    if (offlineScans[i].isEmployeeScan) rb+=",\"isEmployeeScan\":true,\"employeeId\":\""+offlineScans[i].employeeId+"\",\"employeeName\":\"\",\"action\":\""+offlineScans[i].action+"\"";
+    else rb+=",\"isEmployeeScan\":false";
+    rb+="}";
+  }
+  rb+="]}";
+  int code=http.POST(rb); stopSpinner(); http.end();
+  if (code>=200&&code<300) {
+    clearScansData(); storedScanCount=0; nvsDirty=false;
+    showMessageNB("Synced!",String(totalToSend)+" events sent");
+    Serial.println("[Bulk] OK: "+String(totalToSend));
+  } else {
+    showMessageNB("Sync failed","Retry in 5min ("+String(code)+")");
+    Serial.println("[Bulk] Failed HTTP "+String(code));
+  }
+  messageShowUntil=millis()+2000; messagePending=true;
+  pendingReturnScreen=isEmployeeSignedIn?"employee":"operator";
+  isSendingBulk=false; return (code>=200&&code<300);
+}
+
+// ─── WO Count ─────────────────────────────────────────────────────────────────
+bool maybeCountWO(const String& scanId) {
+  if (!isEmployeeSignedIn||!scanId.startsWith("WO")) return false;
+  if (isWOInHistory(scanId)) { Serial.println("[WO] Dup: "+scanId); return false; }
+  addWOToHistory(scanId); operatorScanCount++;
+  Serial.println("[WO] Counted: "+scanId+" total="+String(operatorScanCount));
+  return true;
+}
+
+// ─── Process Local Scan ───────────────────────────────────────────────────────
+void processLocalScan(String rawScanId) {
+  String scanId=extractEmployeeIdFromUrl(rawScanId);
+  if (scanId.indexOf(INFO_KEYWORD)>=0) { infoModeActive=true; infoModeStartTime=millis(); showInfoScreen(); return; }
+  if (deviceId.length()==0||machineId.length()==0) { showVisualFeedback(false,"Device/Machine not set"); scanFeedbackUntil=millis()+2000; scanFeedbackReturn="operator"; return; }
+  String timestamp=getISOTimeIST(), currentOps=getActiveOpsString();
+
+  if (isEmployeeId(scanId)) {
+    if (isEmployeeSignedIn&&currentEmployeeId==scanId) {
+      addToOfflineStorage(scanId,timestamp,true,scanId,"","signout","");
+      String outId=currentEmployeeId;
+      saveEmployeeData(); clearEmployeeData(); clearWOHistory(); nvsDirty=false;
+      showVisualFeedback(true,outId+" signed out");
+      scanFeedbackUntil=millis()+2000; scanFeedbackReturn="operator"; return;
+    }
+    if (isEmployeeSignedIn&&currentEmployeeId!=scanId) {
+      addToOfflineStorage(currentEmployeeId,timestamp,true,currentEmployeeId,"","signout","");
+      saveEmployeeData(); clearEmployeeData(); clearWOHistory();
+    }
+    currentEmployeeId=scanId; currentEmployeeName=scanId; isEmployeeSignedIn=true; operatorScanCount=0;
+    saveEmployeeData();
+    addToOfflineStorage(scanId,timestamp,true,scanId,"","signin","");
+    showVisualFeedback(true,"Signed in: "+scanId);
+    scanFeedbackUntil=millis()+2000; scanFeedbackReturn="employee"; return;
+  }
+
+  if (isBarcodeId(scanId)) {
+    if (!isEmployeeSignedIn) { showVisualFeedback(false,"No operator signed in"); scanFeedbackUntil=millis()+2000; scanFeedbackReturn="operator"; return; }
+    addToOfflineStorage(scanId,timestamp,false,"","","",currentOps);
+    maybeCountWO(scanId);
+    showVisualFeedback(true,"Scan #"+String(operatorScanCount)+" saved");
+    scanFeedbackUntil=millis()+1500; scanFeedbackReturn="employee"; return;
+  }
+
+  showVisualFeedback(false,"Unknown: "+scanId.substring(0,12));
+  scanFeedbackUntil=millis()+2000; scanFeedbackReturn=isEmployeeSignedIn?"employee":"operator";
+}
+
+// ─── Setup ────────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200); delay(500);
+  SPI.begin(TFT_SCLK,-1,TFT_MOSI,TFT_CS);
+  tft.initR(INITR_BLACKTAB); tft.setRotation(1); tft.fillScreen(ST77XX_BLACK);
+  loadConfig(); loadFirmwareVersion(); loadMachineName();
+  loadEmployeeData(); loadScansData(); loadWOHistory(); loadBreakState();
+  ScannerSerial.begin(9600,SERIAL_8N1,SCANNER_RX,SCANNER_TX);
+  showSplashScreen();
+  if (!wifiConfigured||machineId.length()==0) { startConfigMode(); }
+  else {
+    connectToWiFi();
+    if (currentEmployeeName.isEmpty()) { isEmployeeSignedIn=false; currentEmployeeId=""; operatorScanCount=0; if (isInBreakMode()) endBreak("orphan"); }
+    lastWiFiState=isWiFiConnected();
+    if (storedScanCount>0&&isWiFiConnected()) sendBatchNow=true;
+    if (isInBreakMode()) { showBreakScreen(); lastBreakScreenRefresh=millis(); }
+    else if (isEmployeeSignedIn) showEmployeeScreen();
+    else showNoOperatorScreen();
+  }
+  unsigned long now=millis();
+  lastHeaderRefresh=now; lastBatchSend=now; lastNVSPersist=now;
+  lastWiFiConnectionAttempt=now; lastUpdateCheck=now; lastFirebasePoll=now;
+  lastAcceptedScanTime=0; nvsDirty=false;
+}
+
+// ─── Loop ─────────────────────────────────────────────────────────────────────
+void loop() {
+  if (inConfigMode) { dnsServer.processNextRequest(); server.handleClient(); if (millis()-configModeStartTime>CONFIG_MODE_TIMEOUT) ESP.restart(); return; }
+
+  unsigned long now=millis();
+
+  if (visualFeedbackActive&&now>=visualFeedbackUntil) { visualFeedbackActive=false; returnToHomeScreen(); }
+  if (messagePending&&now>=messageShowUntil) { messagePending=false; returnToHomeScreen(); }
+  if (scanFeedbackUntil>0&&now>=scanFeedbackUntil) { scanFeedbackUntil=0; if (!visualFeedbackActive) returnToHomeScreen(); scanFeedbackReturn=""; }
+  if (infoModeActive&&(now-infoModeStartTime>INFO_MODE_DURATION)) { infoModeActive=false; returnToHomeScreen(); }
+
+  checkWiFiConnection();
+
+  if (updateAvailable&&isWiFiConnected()&&!infoModeActive&&!isInBreakMode()) {
+    showUpdateScreen("Update available!",0); delay(2000);
+    if (performOTAUpdate()) ESP.restart(); else { updateAvailable=false; returnToHomeScreen(); }
+  }
+
+  // 5-min batch send
+  if (isWiFiConnected()&&!isSendingBulk&&storedScanCount>0&&!infoModeActive) {
+    bool scheduled=(now-lastBatchSend)>=BATCH_SEND_INTERVAL;
+    if (sendBatchNow||scheduled) { sendBatchNow=false; lastBatchSend=now; sendBulkScans(); }
+  }
+
+  if (nvsDirty&&(now-lastNVSPersist)>=NVS_PERSIST_INTERVAL) { lastNVSPersist=now; persistNVS(); }
+
+  if ((now-lastHeaderRefresh)>HEADER_REFRESH_INTERVAL&&!visualFeedbackActive&&!isInBreakMode()) { drawHeader(); lastHeaderRefresh=now; }
+
+  if (isInBreakMode()&&!visualFeedbackActive&&!messagePending&&scanFeedbackUntil==0&&!infoModeActive&&(now-lastBreakScreenRefresh)>BREAK_TIMER_REFRESH_MS) { lastBreakScreenRefresh=now; refreshBreakTimerArea(); }
+
+  while (ScannerSerial.available()) {
+    char c=ScannerSerial.read();
+    if (c=='\n'||c=='\r') {
+      if (scannedData.length()>0) {
+        String scanValue=scannedData; scannedData=""; scanValue.trim();
+        if ((now-lastAcceptedScanTime)<SCAN_DEBOUNCE_MS) { Serial.println("[Debounce] Ignored: "+scanValue); while (ScannerSerial.available()) ScannerSerial.read(); scannedData=""; break; }
+        lastAcceptedScanTime=now;
+
+        if (checkForAdminConfig(scanValue)) {
+          tft.fillScreen(ST77XX_BLACK); drawHeader(); tft.setTextColor(ST77XX_RED); tft.setTextSize(1); tft.setCursor(5,30); tft.println("ADMIN CONFIG"); tft.setTextColor(ST77XX_YELLOW); tft.setCursor(5,50); tft.println("Wiping memory...");
+          wipeAllMemory(); delay(1500); tft.setTextColor(ST77XX_GREEN); tft.setCursor(5,70); tft.println("Cleared"); tft.setTextColor(ST77XX_WHITE); tft.setCursor(5,90); tft.println("Entering setup..."); delay(1500); startConfigMode(); return;
+        }
+        if (isWiFiUpdateBarcode(scanValue)) { handleWiFiUpdateBarcode(scanValue); scannedData=""; break; }
+        if (isBreakBarcode(scanValue)) {
+          BreakReason newReason=parseBreakReason(scanValue);
+          if (!isEmployeeSignedIn) { showVisualFeedback(false,"Sign in operator first"); scanFeedbackUntil=now+2000; scanFeedbackReturn="operator"; }
+          else if (isInBreakMode()&&currentBreakReason==newReason) {
+            unsigned long elapsed=getBreakElapsedSeconds(); String endMsg=breakReasonLabel(currentBreakReason)+": "+formatBreakElapsed(elapsed);
+            endBreak("manual"); showVisualFeedback(true,endMsg); scanFeedbackUntil=now+2000; scanFeedbackReturn="employee";
+          } else if (isInBreakMode()&&currentBreakReason!=newReason) { endBreak("switched"); startBreak(newReason); showBreakScreen(); lastBreakScreenRefresh=now; }
+          else { startBreak(newReason); showBreakScreen(); lastBreakScreenRefresh=now; }
+          scannedData=""; break;
+        }
+        if (isInBreakMode()) { endBreak("auto_other_scan"); }
+        if (isOpsKeyword(scanValue)) {
+          String opName=extractOpName(scanValue);
+          if (opName.length()>0) { bool si=toggleOperation(opName); showOpsToggleScreen(opName,si); pushActiveOpsToFirebase(); scanFeedbackUntil=now+1500; scanFeedbackReturn=isEmployeeSignedIn?"employee":"operator"; }
+          scannedData=""; break;
+        }
+        if (isOpsGroupKeyword(scanValue)) {
+          String gOps[MAX_ACTIVE_OPS]; int count=extractGroupOps(scanValue,gOps,MAX_ACTIVE_OPS);
+          if (count>0) { int si=0,so=0; toggleGroupOps(gOps,count,si,so); showGroupOpsToggleScreen(count,si,so); pushActiveOpsToFirebase(); scanFeedbackUntil=now+2000; scanFeedbackReturn=isEmployeeSignedIn?"employee":"operator"; }
+          scannedData=""; break;
+        }
+        processLocalScan(scanValue);
+        scannedData=""; break;
+      }
+    } else { scannedData+=c; }
+  }
+}
